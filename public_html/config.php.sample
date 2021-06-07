@@ -1,0 +1,401 @@
+<?php
+/**
+ * config.php.sample
+ *
+ * @package default
+ */
+
+
+$URL_PREFIX = "";
+$DB_NAME = "dbname";
+$DB_USER = "dbuser";
+$DB_PASS = "dbpass";
+$DB_HOST = "127.0.0.1";
+$DB_PORT = 3306;
+$UPLOADS = "../uploads";
+$TMP = "../tmp";
+$IMAGES = "../images";
+$ARCHIVE = "../archive";
+$IMAGE_BASE = "image.php?id=";
+
+
+/**
+ *
+ * @return unknown
+ */
+function base_url() {
+	global $URL_PREFIX;
+
+	$url      = "http://" . $_SERVER['HTTP_HOST'] ."/". $URL_PREFIX;
+	$validURL = str_replace("&", "&amp", $url);
+	return $validURL;
+}
+
+
+/**
+ *
+ * @param unknown $directory
+ * @return unknown
+ */
+function getFolderSize($directory) {
+	$totalSize = 0;
+	$directoryArray = scandir($directory);
+
+	foreach ($directoryArray as $key => $fileName) {
+		if ($fileName != ".." && $fileName != ".") {
+			if (is_dir($directory . "/" . $fileName)) {
+				$totalSize = $totalSize + getFolderSize($directory . "/" . $fileName);
+			} else if (is_file($directory . "/". $fileName)) {
+				$totalSize = $totalSize + filesize($directory. "/". $fileName);
+			}
+		}
+	}
+	return $totalSize;
+}
+
+
+/**
+ *
+ * @param unknown $sizeInBytes
+ * @return unknown
+ */
+function getFormattedSize($sizeInBytes) {
+
+	if ($sizeInBytes < 1024) {
+		return $sizeInBytes . " bytes";
+	} else if ($sizeInBytes < 1024*1024) {
+		return $sizeInBytes/1024 . " KB";
+	} else if ($sizeInBytes < 1024*1024*1024) {
+		return round($sizeInBytes/(1024*1024), 2) . " MB";
+	} else if ($sizeInBytes < 1024*1024*1024*1024) {
+		return round($sizeInBytes/(1024*1024*1024), 2) . " GB";
+	} else if ($sizeInBytes < 1024*1024*1024*1024*1024) {
+		return round($sizeInBytes/(1024*1024*1024*1024), 2) . " TB";
+	} else {
+		return "Greater than 1024 TB";
+	}
+
+}
+
+
+/**
+ *
+ */
+function GetStats() {
+	global $redis, $conn;
+	$stats= array();
+	$approved = @$conn->query("SELECT count(id) as count from games where approved IS NOT NULL")->fetch_assoc()["count"];
+	$nonappr = @$conn->query("SELECT count(id) as count from games where approved IS NULL")->fetch_assoc()["count"];
+	$upload = @$conn->query("SELECT count(id) as count from uploads")->fetch_assoc()["count"];
+	$moderation = @$conn->query("SELECT count(id) as count from uploads where imported IS NULL")->fetch_assoc()["count"];
+	$invalid = @$conn->query("SELECT count(id) as count from uploads where invalid IS NOT NULL")->fetch_assoc()["count"];
+	$total = getFormattedSize(getFolderSize("/data/home/abandonware"));
+	$stats[] = array("info" => "Approved games", "val" => $approved);
+	$stats[] = array("info" => "Approval pending games", "val" => $nonappr);
+	$stats[] = array("info" => "Total uploaded games", "val" => $upload);
+	$stats[] = array("info" => "Games waiting for moderation", "val" => $moderation);
+	$stats[] = array("info" => "Rejected approvals", "val" => $invalid);
+	$stats[] = array("info" => "Total size", "val" => $total);
+	sort($stats);
+	$redis->set("abandonware_stats", json_encode($stats));
+}
+
+
+/**
+ *
+ * @param unknown $file
+ * @param unknown $decimals (optional)
+ * @return unknown
+ */
+function human_filesize($file, $decimals = 2) {
+	try {
+		$bytes = filesize($file);
+		$sz = 'BKMGTP';
+		$factor = floor((strlen($bytes) - 1) / 3);
+		return sprintf("%.{$decimals}f", $bytes / pow(1024, $factor)) . @$sz[$factor];
+	} catch (Exception $ex) {
+		return "0 bytes";
+	}
+
+
+}
+
+
+/**
+ *
+ * @param unknown $string
+ * @return unknown
+ */
+function mysql_unreal_escape_string($string) {
+	$characters = array('x00', 'n', 'r', '\\', '\'', '"', 'x1a');
+	$o_chars = array("\x00", "\n", "\r", "\\", "'", "\"", "\x1a");
+	for ($i = 0; $i < strlen($string); $i++) {
+		if (substr($string, $i, 1) == '\\') {
+			foreach ($characters as $index => $char) {
+				if ($i <= strlen($string) - strlen($char) && substr($string, $i + 1, strlen($char)) == $char) {
+					$string = substr_replace($string, $o_chars[$index], $i, strlen($char) + 1);
+					break;
+				}
+			}
+		}
+	}
+	return $string;
+}
+
+
+/**
+ *
+ * @param unknown $path
+ * @return unknown
+ */
+function ShortenPath($path) {
+	if (strlen($path) > 12) {
+		$path = str_replace(' ', '', $path);
+		return substr($path, 0, 6)."~1.".substr($path, -3);
+	}
+	return $path;
+}
+
+
+/**
+ *
+ * @param unknown $str
+ * @return unknown
+ */
+function RemoveSpecChars($str) {
+	$str = str_replace(' ', '-', $str); // Replaces all spaces with hyphens.
+	return preg_replace('/[^A-Za-z0-9\-]/', '', $str); // Removes special chars.
+}
+
+
+/**
+ *
+ * @param unknown $oldzip
+ * @param unknown $name
+ * @param unknown $exe
+ * @param unknown $uid
+ * @return unknown
+ */
+function BuildGamePackagev2($oldzip, $name, $exe, $uid) {
+	global $ARCHIVE, $TMP;
+	// extract directory
+	$big_directories = 0;
+	$zip = new ZipArchive;
+	$files = array();
+	$res = $zip->open($oldzip);
+	if ($res === TRUE) {
+		$dirname = pathinfo($oldzip, PATHINFO_FILENAME);
+		for ( $i = 0; $i < $zip->numFiles; $i++ ) {
+			$stat = $zip->statIndex($i);
+			$failas = $stat['name'];
+			$files[] = $failas;
+			if (strlen(basename($failas)) > 12) $big_directories = 1;
+		}
+		$dirname = ShortenPath(pathinfo($oldzip, PATHINFO_FILENAME));
+		if (!file_exists($TMP."/".$dirname)) {
+			mkdir($TMP."/".$dirname, 0755, true);
+		}
+		$zip->extractTo($TMP."/".$dirname);
+		$zip->close();
+
+		if (strlen(basename($exe)) > 12) {
+			// we need to shorted file in the directory
+			$shorten_exe = ShortenPath($exe);
+			$diras = dirname($exe);
+			rename($TMP."/".$dirname."/".$exe, $TMP."/".$dirname."/".$diras."/".$shorten_exe);
+		}
+
+		$newzip = RemoveSpecChars($name)."_".$uid.".abw";
+		$rootPath = $TMP."/".$dirname;
+		//file_put_contents($rootPath."/package.json", json_encode($game));
+		Zip($rootPath, $ARCHIVE."/".$newzip);
+		//deleteDir($TMP."/".$directory);
+		return array($exe, $newzip);
+	}
+
+
+}
+
+
+/**
+ *
+ * @param unknown $source
+ * @param unknown $destination
+ * @return unknown
+ */
+function Zip($source, $destination) {
+	if (!extension_loaded('zip') || !file_exists($source)) {
+		return false;
+	}
+
+	$zip = new ZipArchive();
+	if (!$zip->open($destination, ZIPARCHIVE::CREATE)) {
+		return false;
+	}
+
+	$source = str_replace('\\', '/', realpath($source));
+
+	if (is_dir($source) === true) {
+		$files = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($source), RecursiveIteratorIterator::SELF_FIRST);
+
+		foreach ($files as $file) {
+			$file = str_replace('\\', '/', $file);
+
+			// Ignore "." and ".." folders
+			if ( in_array(substr($file, strrpos($file, '/')+1), array('.', '..')) )
+				continue;
+
+			$file = realpath($file);
+
+			if (is_dir($file) === true) {
+				$zip->addEmptyDir(str_replace($source . '/', '', $file . '/'));
+			}
+			else if (is_file($file) === true) {
+				$zip->addFromString(str_replace($source . '/', '', $file), file_get_contents($file));
+			}
+		}
+	}
+	else if (is_file($source) === true) {
+		$zip->addFromString(basename($source), file_get_contents($source));
+	}
+
+	return $zip->close();
+}
+
+
+/**
+ *
+ * @param unknown $game_uid
+ * @return unknown
+ */
+function GetGenresForGame($game_uid) {
+	global $conn;
+	$sql = "select games.name as name, genres.name as genre from games inner join games_genres on games.id = games_genres.game_id inner join genres on games_genres.genre_id = genres.id where games.uid = '$game_uid'";
+	$genres = array();
+	if (!$result = $conn->query($sql)) {
+		error_log("Error description: " . $conn -> error, 0);
+	}
+	if ($result->num_rows > 0) {
+		while ($row = $result->fetch_assoc()) {
+			$genres[] = $row["genre"];
+		}
+	}
+	return $genres;
+}
+
+
+/**
+ *
+ * @param unknown $game_uid
+ * @return unknown
+ */
+function GetModesForGame($game_uid) {
+	global $conn;
+	$sql = "select games.name as name, modes.name as mode from games inner join games_modes on games.id = games_modes.game_id inner join modes on games_modes.mode_id = modes.id where games.uid = '$game_uid'";
+	$modes = array();
+	if (!$result = $conn->query($sql)) {
+		error_log("Error description: " . $conn -> error, 0);
+	}
+	if ($result->num_rows > 0) {
+		while ($row = $result->fetch_assoc()) {
+			$modes[] = $row["mode"];
+		}
+	}
+	return $modes;
+}
+
+
+/**
+ *
+ * @param unknown $filepath
+ * @return unknown
+ */
+function isZipFile($filepath) {
+	$fh = fopen($filepath, 'r');
+	$bytes = fread($fh, 4);
+	fclose($fh);
+	return '504b0304' === bin2hex($bytes);
+}
+
+
+/**
+ *
+ * @return unknown
+ */
+function GameModes() {
+	global $conn;
+	$modes = array();
+	if ($conn->connect_error) {
+		error_log("Connection failed: " . $conn->connect_error);
+	}
+	$sql = "select id,name from modes";
+	if (!$result = $conn->query($sql)) {
+		error_log("Error description: " . $mysqli -> error, 0);
+		return $modes;
+	}
+
+	while ($row = $result->fetch_assoc()) {
+		$modes[] = array('id' => $row["id"], 'name' => $row["name"]);
+	}
+	return $modes;
+}
+
+
+/**
+ *
+ * @return unknown
+ */
+function GameGenres() {
+	global $conn;
+	$genres = array();
+	if ($conn->connect_error) {
+		error_log("Connection failed: " . $conn->connect_error);
+	}
+	$sql = "select id,name from genres";
+	if (!$result = $conn->query($sql)) {
+		error_log("Error description: " . $mysqli -> error, 0);
+		return $genres;
+	}
+
+	while ($row = $result->fetch_assoc()) {
+		$genres[] = array('id' => $row["id"], 'name' => $row["name"]);
+	}
+	return $genres;
+}
+
+
+/**
+ *
+ * @param unknown $text
+ */
+function showerror($text) {
+	echo '<div class="alert alert-danger" role="alert">
+$text
+</div>';
+}
+
+
+/**
+ *
+ * @param unknown $text
+ */
+function showok($text) {
+	echo '<div class="alert alert-danger" role="alert">
+$text
+</div>';
+}
+
+
+/**
+ *
+ * @param unknown $text
+ */
+function WriteLog($text) {
+	file_put_contents("../app.log", $text."\n", FILE_APPEND | LOCK_EX);
+}
+
+
+@$redis = new Redis();
+@$redis->connect('127.0.0.1', 6379);
+@$conn = new mysqli($DB_HOST, $DB_USER, $DB_PASS, $DB_NAME);
+?>
